@@ -725,21 +725,19 @@ pub mod parsing {
         let mut repr = lit.to_string();
         repr.insert(0, '-');
 
-        if !(repr.ends_with("f32") || repr.ends_with("f64")) {
-            if let Some((digits, suffix)) = value::parse_lit_int(&repr) {
-                if let Some(mut token) = value::to_literal(&repr, &digits, &suffix) {
-                    token.set_span(span);
-                    return Some((
-                        Lit::Int(LitInt {
-                            repr: Box::new(LitIntRepr {
-                                token,
-                                digits,
-                                suffix,
-                            }),
+        if let Some((digits, suffix)) = value::parse_lit_int(&repr) {
+            if let Some(mut token) = value::to_literal(&repr, &digits, &suffix) {
+                token.set_span(span);
+                return Some((
+                    Lit::Int(LitInt {
+                        repr: Box::new(LitIntRepr {
+                            token,
+                            digits,
+                            suffix,
                         }),
-                        rest,
-                    ));
-                }
+                    }),
+                    rest,
+                ));
             }
         }
 
@@ -920,16 +918,14 @@ mod value {
                     });
                 }
                 b'0'..=b'9' | b'-' => {
-                    if !(repr.ends_with("f32") || repr.ends_with("f64")) {
-                        if let Some((digits, suffix)) = parse_lit_int(&repr) {
-                            return Lit::Int(LitInt {
-                                repr: Box::new(LitIntRepr {
-                                    token,
-                                    digits,
-                                    suffix,
-                                }),
-                            });
-                        }
+                    if let Some((digits, suffix)) = parse_lit_int(&repr) {
+                        return Lit::Int(LitInt {
+                            repr: Box::new(LitIntRepr {
+                                token,
+                                digits,
+                                suffix,
+                            }),
+                        });
                     }
                     if let Some((digits, suffix)) = parse_lit_float(&repr) {
                         return Lit::Float(LitFloat {
@@ -1289,27 +1285,28 @@ mod value {
         s = &s[1..];
 
         let mut ch = 0;
-        for _ in 0..6 {
+        let mut digits = 0;
+        loop {
             let b = byte(s, 0);
-            match b {
-                b'0'..=b'9' => {
-                    ch *= 0x10;
-                    ch += u32::from(b - b'0');
+            let digit = match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => 10 + b - b'a',
+                b'A'..=b'F' => 10 + b - b'A',
+                b'_' if digits > 0 => {
                     s = &s[1..];
+                    continue;
                 }
-                b'a'..=b'f' => {
-                    ch *= 0x10;
-                    ch += u32::from(10 + b - b'a');
-                    s = &s[1..];
-                }
-                b'A'..=b'F' => {
-                    ch *= 0x10;
-                    ch += u32::from(10 + b - b'A');
-                    s = &s[1..];
-                }
+                b'}' if digits == 0 => panic!("invalid empty unicode escape"),
                 b'}' => break,
                 _ => panic!("unexpected non-hex character after \\u"),
+            };
+            if digits == 6 {
+                panic!("overlong unicode escape (must have at most 6 hex digits)");
             }
+            ch *= 0x10;
+            ch += u32::from(digit);
+            digits += 1;
+            s = &s[1..];
         }
         assert!(byte(s, 0) == b'}');
         s = &s[1..];
@@ -1346,7 +1343,7 @@ mod value {
         };
 
         let mut value = BigInt::new();
-        loop {
+        'outer: loop {
             let b = byte(s, 0);
             let digit = match b {
                 b'0'..=b'9' => b - b'0',
@@ -1356,10 +1353,32 @@ mod value {
                     s = &s[1..];
                     continue;
                 }
-                // NOTE: Looking at a floating point literal, we don't want to
-                // consider these integers.
+                // If looking at a floating point literal, we don't want to
+                // consider it an integer.
                 b'.' if base == 10 => return None,
-                b'e' | b'E' if base == 10 => return None,
+                b'e' | b'E' if base == 10 => {
+                    let mut has_exp = false;
+                    for (i, b) in s[1..].bytes().enumerate() {
+                        match b {
+                            b'_' => {}
+                            b'-' | b'+' => return None,
+                            b'0'..=b'9' => has_exp = true,
+                            _ => {
+                                let suffix = &s[1 + i..];
+                                if has_exp && crate::ident::xid_ok(suffix) {
+                                    return None;
+                                } else {
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                    if has_exp {
+                        return None;
+                    } else {
+                        break;
+                    }
+                }
                 _ => break,
             };
 
@@ -1425,6 +1444,14 @@ mod value {
                     bytes[write] = b'.';
                 }
                 b'e' | b'E' => {
+                    match bytes[read + 1..]
+                        .iter()
+                        .find(|b| **b != b'_')
+                        .unwrap_or(&b'\0')
+                    {
+                        b'-' | b'+' | b'0'..=b'9' => {}
+                        _ => break,
+                    }
                     if has_e {
                         if has_exponent {
                             break;
